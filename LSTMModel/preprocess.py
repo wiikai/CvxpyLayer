@@ -2,6 +2,7 @@ import numpy as np
 import pandas as pd
 import torch
 from torch.utils.data import Dataset
+import quool
 
 def cov_matrix_sqrt_svd(cov_matrix):
     U, S, Vt = np.linalg.svd(cov_matrix)
@@ -45,30 +46,6 @@ def madoutlier(
     else:
         return apply_mad(df)
 
-class FactorDataset(Dataset):
-    def __init__(self, data):
-        self.data = data
-        self.time_slices = data.index.get_level_values(0).unique()
-        self.cov_matrix = data.index.get_level_values(1).unique()
-        self.label = 'future'
-
-    def __len__(self):
-        return len(self.time_slices)
-
-    def __getitem__(self, idx):
-        time_point = self.time_slices[idx]
-        slice_data = self.data.loc[time_point]
-
-        features = slice_data.drop(columns=[self.label] + list(self.cov_matrix)).values
-        label = slice_data[self.label].values
-        cov_matrix = slice_data[self.cov_matrix].values
-        Q_sqrt = cov_matrix_sqrt_svd(cov_matrix)
-
-        Q_sqrt_tensor = torch.tensor(Q_sqrt, dtype=torch.float32)
-        features_tensor = torch.tensor(features, dtype=torch.float32)
-        label_tensor = torch.tensor(label, dtype=torch.float32)
-        return features_tensor, Q_sqrt_tensor, label_tensor
-
 class LSTMDataset(Dataset):
     def __init__(self, data, window_size=30):
         self.data = data
@@ -87,3 +64,16 @@ class LSTMDataset(Dataset):
         cov_matrix_tensor = torch.tensor(cov_matrix, dtype=torch.float32)
         label_tensor = torch.tensor(label, dtype=torch.float32)
         return slice_data_tensor, cov_matrix_tensor, label_tensor
+    
+
+cvlayer = quool.Factor("./data/cv-layer-factor", code_level="order_book_id", date_level="date")
+cv_price = quool.Factor("./data/cv-layer-price", code_level="order_book_id", date_level="date")
+
+
+if __name__ == '__main__':
+    processor= [(madoutlier,{'dev': 5, 'drop': False}), zscore]
+    stop = '20240701'
+    rollback = cvlayer.get_trading_days_rollback(stop, 1800 + 63*9 + 21*2 + 30-2)
+    data = cvlayer.read('1d_ret, 20d_future_ret',start=rollback, stop=stop, processor=None).swaplevel('date', 'order_book_id').sort_index()
+    data = data.rename(columns={'20d_future_ret':'future'})
+    data.to_parquet('test.parquet')

@@ -6,111 +6,18 @@ import torch.optim as optim
 import cvxpy as cp
 from cvxpylayers.torch import CvxpyLayer
 from torch.utils.data import DataLoader
-from preprocess import FactorDataset, LSTMDataset, tensor_minmax
+from preprocess import LSTMDataset
+from model import LSTMModel
 import matplotlib.pyplot as plt
+import random
 
-class FactorModel(nn.Module):
-    
-    def __init__(self, input_dim, hidden_dim, output_dim, lower, upper):
-        super(FactorModel, self).__init__()
-        self.fc1 = nn.Linear(input_dim, hidden_dim)
-        self.leaky_relu = nn.LeakyReLU(negative_slope=-0.1)
-        self.fc2 = nn.Linear(hidden_dim, output_dim)
-        self.softmax = nn.Softmax(dim=1)
-        self.hardtanh = nn.Hardtanh(min_val=lower, max_val=upper)
+def set_seed(seed):
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    random.seed(seed)
 
-        n = 4
-        self.c = nn.Parameter(torch.tensor(0.1)) # 较大的 c 倾向于更分散的权重分布
-        b = cp.Parameter(n, nonneg=True) # 风险预算，前向传播
-        Q_sqrt = cp.Parameter((n, n)) # 斜方差矩阵的平方根
-        y = cp.Variable(n)   
-
-        obj = cp.Minimize(cp.sum_squares(Q_sqrt @ y)) # 最小化组合的方差，控制总风险
-
-        cons = [
-            y >= 0, 
-            b.T @ cp.log(y) >= self.c.detach().numpy(), # 每个资产满足特定的风险分配，对数函数线性化一些非线性关系具有凸优化的特性
-        ]
-
-        prob = cp.Problem(obj, cons)
-        self.cvxpy_layer = CvxpyLayer(
-            prob, 
-            parameters=[b, Q_sqrt], 
-            variables=[y]
-        )
-
-    def forward(self, x, Q_sqrt):
-        b = self.fc1(x.view(x.size(0), -1)) # [batch_size, 5, 11] -> [batch_size, 5*11]
-        b = self.leaky_relu(b)
-        b = self.fc2(b)
-        b = self.softmax(b)
-        b = self.hardtanh(b)
-        b = tensor_minmax(b)
-
-        y, = self.cvxpy_layer(b, Q_sqrt)
-        w = y / y.sum(dim=1, keepdim=True)
-        return w
-    
-        # b = self.fc1(x)
-        # b = self.leaky_relu(b)
-        # b = self.fc2(b)
-        # b = self.softmax(b)
-        # b = self.hardtanh(b)
-        # b = tensor_minmax(b)
-        # b = b.view(b.size(0), -1)
-
-        # y, = self.cvxpy_layer(b, Q_sqrt)
-        # w = y / y.sum(dim=1, keepdim=True)
-        # return w
-
-class LSTMModel(nn.Module):
-    
-    def __init__(self, input_dim, lstm_hidden_dim, fc_hidden_dim, output_dim, lower, upper): 
-        super(LSTMModel, self).__init__()
-        
-        self.lstm = nn.LSTM(input_size=input_dim, hidden_size=lstm_hidden_dim, batch_first=True)
-        self.fc1 = nn.Linear(lstm_hidden_dim, fc_hidden_dim)
-        self.leaky_relu = nn.LeakyReLU(negative_slope=-0.1)
-        self.fc2 = nn.Linear(fc_hidden_dim, output_dim)
-        self.softmax = nn.Softmax(dim=1)
-        self.hardtanh = nn.Hardtanh(min_val=lower, max_val=upper)
-        
-        n = output_dim
-        self.c = nn.Parameter(torch.tensor(0.1))  # 风险分散系数
-        
-        b = cp.Parameter(n, nonneg=True)
-        Q_sqrt = cp.Parameter((n, n))
-        y = cp.Variable(n)
-
-        obj = cp.Minimize(cp.sum_squares(Q_sqrt @ y))  
-
-        cons = [
-            y >= 0,
-            b.T @ cp.log(y) >= self.c.detach().numpy(),  
-        ]
-
-        prob = cp.Problem(obj, cons)
-        self.cvxpy_layer = CvxpyLayer(prob, parameters=[b, Q_sqrt], variables=[y])
-
-    def forward(self, x, Q_sqrt):
-        # LSTM 前向传播
-        lstm_out, (h_n, c_n) = self.lstm(x)  # 输入 x 大小为 [batch_size, time_step, lstm_input_dim] 过去 30 个交易日 5 个资产的日收益率
-        last_output = lstm_out[:, -1, :] # 最后一个时间步长的隐藏层
-
-        # 全连接层前向传播
-        b = self.fc1(last_output)
-        b = self.leaky_relu(b)
-        b = self.fc2(b)
-        b = self.softmax(b)
-        b = self.hardtanh(b)
-        b = tensor_minmax(b)
-        
-        # 风险预算层
-        y, = self.cvxpy_layer(b, Q_sqrt)
-        w = y / y.sum(dim=1, keepdim=True)
-        return w
-
-       
 def train_model(train_dataloader, val_dataloader, model, optimizer, epochs=50, early_stopping=10):
     patience_counter = 0
     best_loss = np.inf
@@ -165,7 +72,7 @@ def test_model(dataloader, model):
     return total_loss / len(dataloader)
 
 def rolling_train(data, window_size=1800, train_size=1500, val_size=300, roll_step=100, gap=21, epochs=50, early_stopping=10):
-    data_slice = 29 # 29 for LSTM, 0 for Factor
+    data_slice = 29
     levels = data.index.get_level_values(0).drop_duplicates()
     data = data.loc[levels]
     max_index = len(levels) - window_size - gap * 2 - roll_step - data_slice
@@ -200,7 +107,6 @@ def rolling_train(data, window_size=1800, train_size=1500, val_size=300, roll_st
         #     print(batch_labels.shape)
         #     break    
 
-        # model = FactorModel(input_dim=44, hidden_dim=10, output_dim=4, lower=0.05, upper=0.35)
         model = LSTMModel(input_dim=4, lstm_hidden_dim=44, fc_hidden_dim=10, output_dim=4, lower=0.05, upper=0.25)
         optimizer = optim.Adam(model.parameters(), lr=0.001)
         train_losses, val_losses, best_model = train_model(train_dataloader, val_dataloader, model, optimizer, epochs=epochs, early_stopping=early_stopping)
@@ -213,7 +119,7 @@ def rolling_train(data, window_size=1800, train_size=1500, val_size=300, roll_st
         plt.ylabel('Loss')
         plt.legend()
         plt.tight_layout()
-        plt.savefig(f'learning_curve_{test_dates[-roll_step:][0].strftime("%Y%m%d")}-{test_dates[-1].strftime("%Y%m%d")}.png')
+        plt.savefig(f'./test/learning_curve_{test_dates[-roll_step:][0].strftime("%Y%m%d")}-{test_dates[-1].strftime("%Y%m%d")}.png')
         plt.close()
 
         model.load_state_dict(best_model)
@@ -227,4 +133,12 @@ def rolling_train(data, window_size=1800, train_size=1500, val_size=300, roll_st
         i += roll_step
         
     predictions.to_csv('./test/Weights.xlsx')
-    
+
+
+def main():
+    set_seed(0)
+    data = pd.read_parquet('test.parquet')
+    rolling_train(data)
+
+if __name__ == '__main__':
+     main()
